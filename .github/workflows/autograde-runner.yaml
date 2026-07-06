@@ -20,7 +20,7 @@ on:
 permissions:
   contents: write
   statuses: write
-  # pull-requests: write powers the opt-in Feedback PR (issue #86). The
+  # pull-requests: write powers the opt-in Feedback PR. The
   # calling shim must grant the same scope — a reusable workflow's
   # effective token is the intersection with the caller's permissions.
   pull-requests: write
@@ -37,6 +37,9 @@ jobs:
   setup:
     runs-on: ubuntu-latest
     outputs:
+      # 'true' -> pushed commit is the acceptance commit; skip the tag/read
+      # steps and the grade job (no submission tag, no release).
+      is-acceptance:  ${{ steps.acceptance.outputs.is-acceptance }}
       submission-tag: ${{ steps.read.outputs.submission-tag }}
       runs-on:        ${{ steps.read.outputs.runs-on }}
       container:      ${{ steps.read.outputs.container }}
@@ -44,25 +47,84 @@ jobs:
       node:           ${{ steps.read.outputs.node }}
       java:           ${{ steps.read.outputs.java }}
       go:             ${{ steps.read.outputs.go }}
+      rust:           ${{ steps.read.outputs.rust }}
       apt:            ${{ steps.read.outputs.apt }}
       base-url:       ${{ steps.read.outputs.base-url }}
       classroom:      ${{ steps.read.outputs.classroom }}
       assignment:     ${{ steps.read.outputs.assignment }}
+      secret:         ${{ steps.read.outputs.secret }}
       feedback-pr:    ${{ steps.read.outputs.feedback-pr }}
       mode:           ${{ steps.read.outputs.mode }}
       allowed-files:  ${{ steps.read.outputs.allowed-files }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          # Full history -- the acceptance check walks back to the commit
+          # that added .classroom50.yaml; a shallow clone hides it.
+          fetch-depth: 0
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - run: python3 -m pip install --quiet --user pyyaml
+
+      # === Skip the acceptance commit ===
+      # The accept commit (adds .classroom50.yaml + the shim, student-
+      # authored, so it fires this workflow) has nothing to grade. Detect
+      # it via the Pages-fetched runner.py and skip the tag/read steps and
+      # grade job. Branch trigger only (a tag push is always a submission).
+      # Fails open (grades) on a fetch failure.
+      - id: acceptance
+        if: github.ref_type == 'branch'
+        env:
+          REPO_OWNER: ${{ github.repository_owner }}
+          GITHUB_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BASE_URL="https://${REPO_OWNER}.github.io/classroom50"
+          RUNNER_SCRIPT="${RUNNER_TEMP:-/tmp}/classroom50-runner.py"
+          if curl -fsSL --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
+               "${BASE_URL}/runner.py" -o "$RUNNER_SCRIPT"; then
+            # Fail open on a fetched-but-unrunnable runner.py too (invalid
+            # 200 body, syntax error, missing python3): a non-zero detect
+            # exit must grade, not fail the setup job and drop a real
+            # submission. detect_acceptance_mode already exits 0 for every
+            # in-process outcome; this guards the can't-execute case.
+            python3 "$RUNNER_SCRIPT" --detect-acceptance || {
+              echo "::warning::acceptance detection errored; grading proceeds"
+              echo "is-acceptance=false" >> "$GITHUB_OUTPUT"
+            }
+          else
+            echo "::warning::could not fetch runner.py for acceptance check; grading proceeds"
+            echo "is-acceptance=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # === Acceptance-skip commit status ===
+      # A graded run posts a classroom50/autograde commit status (the
+      # grade job's `always()` step); an acceptance skip otherwise posts
+      # nothing, so a client polling the commit-status API can't tell
+      # "skipped because acceptance" from "hasn't run yet". Post an
+      # explicit success status here to keep that polling channel at
+      # parity with the human's check mark (mirrors the Feedback PR
+      # status fallback). Best-effort: never fail the job over it.
+      - name: Acceptance-skip commit status
+        if: steps.acceptance.outputs.is-acceptance == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${GITHUB_SHA}" \
+            -f state="success" \
+            -f context="classroom50/autograde" \
+            -f description="acceptance commit — nothing to grade yet; run gh student submit" \
+            -f target_url="$RUN_URL" >/dev/null 2>&1 || true
 
       # === Tag the submission ===
       # Branch trigger: create submit/<UTC-timestamp>-<short-sha> at
       # the pushed SHA. Tag trigger: reuse the pushed tag. Tags pushed
       # with github.token don't fire workflows (anti-recursion).
       - id: tag
+        if: steps.acceptance.outputs.is-acceptance != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REF: ${{ github.ref }}
@@ -107,6 +169,7 @@ jobs:
       # cli/gh-teacher/runtime.go (runtime block) and
       # cli/gh-teacher/tests.go (declarative tests block).
       - id: read
+        if: steps.acceptance.outputs.is-acceptance != 'true'
         env:
           SUBMISSION_TAG: ${{ steps.tag.outputs.tag }}
           REPO_OWNER: ${{ github.repository_owner }}
@@ -117,10 +180,10 @@ jobs:
           import yaml
 
           _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{1,38}$")
+          _SECRET = re.compile(r"^[a-z0-9]{4,64}$")
           _LANG = re.compile(r"^[A-Za-z0-9._+-]{1,32}$")
           _APT  = re.compile(r"^[a-z0-9][a-z0-9.+-]{0,63}$")
           _IMAGE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,255}$")
-          _SECRET_REF = re.compile(r"^\$\{\{\s*secrets\.[A-Za-z_][A-Za-z0-9_]*\s*\}\}$")
           _USER = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(?::[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$")
           _RUNS_ON_LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
           _DEFAULT_RUNS_ON = "ubuntu-latest"
@@ -151,6 +214,13 @@ jobs:
           classroom  = safe((cfg.get("classroom") or "").strip(),  "classroom",  _SLUG)
           assignment = safe((cfg.get("assignment") or "").strip(), "assignment", _SLUG)
 
+          # Optional capability-URL secret. Present -> resources at
+          # <classroom>/<secret>/; absent -> plain path. Validated against the
+          # same strict regex as the other fields since it composes into a URL.
+          secret = (cfg.get("secret") or "").strip()
+          if secret and not _SECRET.match(secret):
+              fail(f".classroom50.yaml field 'secret' has invalid value {secret!r} (must match {_SECRET.pattern!r}) — re-run `gh student accept`")
+
           owner = os.environ["REPO_OWNER"]
           base_url = f"https://{owner}.github.io/classroom50"
 
@@ -168,7 +238,15 @@ jobs:
                           time.sleep(2 ** attempt); continue
                       raise
 
-          manifest_url = f"{base_url}/{classroom}/assignments.json"
+          # Secret-aware classroom path segment, mirroring runner.py's
+          # _classroom_segment and publish-pages.yaml's dest_prefix. Defined
+          # locally because this setup step runs before runner.py is fetched;
+          # keep it byte-identical to those copies (pinned by
+          # cli/shared/contract/contract_test.go).
+          def classroom_segment(classroom, secret):
+              return f"{classroom}/{secret}" if secret else classroom
+
+          manifest_url = f"{base_url}/{classroom_segment(classroom, secret)}/assignments.json"
           try:
               with get(manifest_url) as resp:
                   manifest = json.load(resp)
@@ -270,7 +348,7 @@ jobs:
           # A hand-edited assignments.json with extra keys (e.g. an
           # `options:` smuggled at runtime level) would otherwise pass
           # this validator silently while the CLI rejects it at write.
-          _RUNTIME_KEYS = {"runs-on", "container", "python", "node", "java", "go", "apt"}
+          _RUNTIME_KEYS = {"runs-on", "container", "python", "node", "java", "go", "rust", "apt"}
           extras = set(runtime) - _RUNTIME_KEYS
           if extras:
               fail(f"runtime has unsupported keys: {sorted(extras)}")
@@ -281,6 +359,7 @@ jobs:
           node      = runtime.get("node")     or ""
           java      = runtime.get("java")     or ""
           go        = runtime.get("go")       or ""
+          rust      = runtime.get("rust")     or ""
           apt       = runtime.get("apt")      or []
 
           # runs-on mirrors GitHub Actions: a single label or an array
@@ -312,8 +391,11 @@ jobs:
                   fail("runtime.container must be an object")
               # Same allow-list discipline at the container level —
               # closes the "smuggle --privileged via container.options"
-              # vector. Mirror Go's containerSpec exactly.
-              _CONTAINER_KEYS = {"image", "credentials", "user"}
+              # vector. Mirror Go's containerSpec exactly. Only `image`
+              # and `user` are accepted; private registries can't be
+              # used for autograding (no safe way to deliver a pull
+              # secret to a student repo), so images must be public.
+              _CONTAINER_KEYS = {"image", "user"}
               c_extras = set(container) - _CONTAINER_KEYS
               if c_extras:
                   fail(f"runtime.container has unsupported keys: {sorted(c_extras)}")
@@ -331,14 +413,6 @@ jobs:
               for lbl in runs_on_labels:
                   if lbl.startswith("macos-") or lbl.startswith("windows-"):
                       fail(f"runtime.runs-on {lbl!r} invalid with container: GitHub Actions runs containers on Ubuntu hosts only")
-              creds = container.get("credentials")
-              if creds is not None:
-                  if not isinstance(creds, dict) or not creds.get("username") or not creds.get("password"):
-                      fail("runtime.container.credentials must include both username and password")
-                  if not isinstance(creds["username"], str) or not isinstance(creds["password"], str):
-                      fail("runtime.container.credentials.username and .password must both be strings")
-                  if not _SECRET_REF.match(creds["password"]):
-                      fail("runtime.container.credentials.password must reference a GitHub Actions secret using the secrets.<NAME> expression syntax")
               # Translate runtime.container.user to GitHub Actions'
               # container.options: --user <value>. Actions doesn't
               # accept container.user directly, but a non-root container
@@ -352,8 +426,6 @@ jobs:
               # any future schema-skew (e.g., a new GHA container key
               # added by Actions) from flowing through unchecked.
               emitted = {"image": image}
-              if creds is not None:
-                  emitted["credentials"] = creds
               if user is not None:
                   emitted["options"] = f"--user {user}"
               if not runs_on_labels:
@@ -376,7 +448,7 @@ jobs:
           # self-hosted target share one code path.
           runs_on_json = json.dumps(runs_on_labels)
 
-          for label, value in [("python", python), ("node", node), ("java", java), ("go", go)]:
+          for label, value in [("python", python), ("node", node), ("java", java), ("go", go), ("rust", rust)]:
               if value and (not isinstance(value, str) or not _LANG.match(value)):
                   fail(f"runtime.{label} {value!r} must match {_LANG.pattern}")
 
@@ -387,7 +459,7 @@ jobs:
                   fail(f"runtime.apt[{i}] {pkg!r} must match {_APT.pattern}")
           apt_str = " ".join(apt)
 
-          # === Feedback PR opt-in (issue #86) ===
+          # === Feedback PR opt-in ===
           # Mirror Go's bool `feedback_pr` field. Re-validated here (like
           # the tests/runtime blocks) so a hand-edited manifest fails at
           # setup with a clear error. Emitted as "true"/"false" so the
@@ -402,7 +474,7 @@ jobs:
           if mode not in ("individual", "group"):
               fail(f"entry {assignment!r}: mode {mode!r} must be 'individual' or 'group'")
 
-          # === Allowed-files allowlist (issue #169) ===
+          # === Allowed-files allowlist ===
           # Re-validate the hand-editable manifest field and emit it as a
           # JSON array for runner.py to enforce.
           allowed_files = entry.get("allowed_files", [])
@@ -428,16 +500,20 @@ jobs:
           emit("node", node)
           emit("java", java)
           emit("go", go)
+          emit("rust", rust)
           emit("apt", apt_str)
           emit("base-url", base_url)
           emit("classroom", classroom)
           emit("assignment", assignment)
+          emit("secret", secret)
           emit("feedback-pr", "true" if feedback_pr else "false")
           emit("mode", mode)
           emit("allowed-files", allowed_files_json)
 
   grade:
     needs: setup
+    # Skip for the acceptance commit (set-latest needs grade, so it skips too).
+    if: needs.setup.outputs.is-acceptance != 'true'
     runs-on:   ${{ fromJSON(needs.setup.outputs.runs-on) }}
     container: ${{ fromJSON(needs.setup.outputs.container) }}
     timeout-minutes: 15
@@ -455,16 +531,19 @@ jobs:
       CLASSROOM:      ${{ needs.setup.outputs.classroom }}
       ASSIGNMENT:     ${{ needs.setup.outputs.assignment }}
       SUBMISSION_TAG: ${{ needs.setup.outputs.submission-tag }}
+      # Optional capability-URL secret from .classroom50.yaml (via setup).
+      # runner.py inserts it into the fetch URLs; empty = plain path.
+      SECRET:         ${{ needs.setup.outputs.secret }}
       # Assignment mode (individual | group) from assignments.json, so
       # runner.py validates a group autograder's multi-username result.json
       # instead of rejecting it. Defaults to the stricter individual rule
       # when absent.
       MODE:           ${{ needs.setup.outputs.mode }}
-      # allowed_files patterns (JSON array) from assignments.json (#169);
+      # allowed_files patterns (JSON array) from assignments.json;
       # runner.py removes disallowed files before grading. "[]" = allow all.
       ALLOWED_FILES:  ${{ needs.setup.outputs.allowed-files }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ needs.setup.outputs.submission-tag }}
           # Full history -- runner.py needs the student's baseline
@@ -478,20 +557,28 @@ jobs:
           python-version: ${{ needs.setup.outputs.python }}
 
       - if: needs.setup.outputs.node != ''
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: ${{ needs.setup.outputs.node }}
 
       - if: needs.setup.outputs.java != ''
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: ${{ needs.setup.outputs.java }}
 
       - if: needs.setup.outputs.go != ''
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           go-version: ${{ needs.setup.outputs.go }}
+
+      # No first-party setup-rust; dtolnay/rust-toolchain is the de-facto
+      # standard. Pinned to @master with an explicit `toolchain:` input
+      # (its @rev-derived default can't read a version from a SHA pin).
+      - if: needs.setup.outputs.rust != ''
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.setup.outputs.rust }}
 
       - if: needs.setup.outputs.apt != '' && runner.os == 'Linux'
         run: |
@@ -510,6 +597,17 @@ jobs:
       - id: autograde
         run: |
           set -euo pipefail
+          # Re-assert the checkout as safe before git-dependent steps. In
+          # a container the bind-mounted repo is owned by the host runner
+          # user but git runs as a different UID, tripping git's "dubious
+          # ownership" guard. actions/checkout's own entry was written
+          # under a now-restored temporary HOME, so set it again here (under
+          # the runtime HOME) so runner.py can read history. Guard the
+          # --add so repeated runs on a persistent-HOME (self-hosted)
+          # runner don't accumulate duplicate lines in ~/.gitconfig.
+          SAFE_DIR="${GITHUB_WORKSPACE:-$PWD}"
+          git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$SAFE_DIR" \
+            || git config --global --add safe.directory "$SAFE_DIR" || true
           RUNNER_SCRIPT="${RUNNER_TEMP:-/tmp}/classroom50-runner.py"
           curl -fsSL --max-time 30 --retry 3 --retry-delay 2 --retry-all-errors \
                "${PAGES_BASE_URL}/runner.py" -o "$RUNNER_SCRIPT"
@@ -555,7 +653,7 @@ jobs:
               --latest=false
           fi
 
-      # === Ensure the Feedback PR (issue #86) ===
+      # === Ensure the Feedback PR ===
       # Opt-in per assignment (feedback-pr). One long-lived PR per repo:
       # base = the frozen `feedback` branch at the baseline commit,
       # head = the default branch, so the teacher reviews the full
