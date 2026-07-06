@@ -1,4 +1,25 @@
 {
   "schema": "classroom50/assignments/v1",
-  "assignments": []
+  "assignments": [
+    {
+      "slug": "kit307-2026",
+      "name": "kit307 2026",
+      "mode": "individual",
+      "autograder": "default",
+      "feedback_pr": true,
+      "template": {
+        "owner": "utas-kit307",
+        "repo": "kit307-2026",
+        "branch": "main"
+      },
+      "description": "This is the repo you'll use for all assessments for this unit.",
+      "due": "2026-10-09T23:10:00Z",
+      "due_meta": {
+        "input": "2026-10-10T10:10:00",
+        "zone": "Australia/Hobart",
+        "offset": "+11:00",
+        "source": "auto-detected"
+      }
+    }
+  ]
 }
