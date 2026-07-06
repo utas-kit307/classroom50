@@ -3,7 +3,7 @@
   "assignments": [
     {
       "slug": "kit307-2026",
-      "name": "kit307 2026",
+      "name": "kit307 base 2026",
       "mode": "individual",
       "autograder": "default",
       "feedback_pr": true,
