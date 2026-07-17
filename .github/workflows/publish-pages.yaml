@@ -11,11 +11,8 @@ name: Publish Pages
 on:
   push:
     branches: ["main"]
-    # Skip the redeploy for roster-only commits: the roster isn't published.
-    # Match both names during the rename window — real repos may carry either
-    # roster.csv or the legacy students.csv (or both).
+    # Skip the redeploy for roster-only commits: students.csv isn't published.
     paths-ignore:
-      - "**/roster.csv"
       - "**/students.csv"
   workflow_dispatch:
 
